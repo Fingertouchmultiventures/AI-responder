@@ -155,34 +155,6 @@ def webhook_receive():
     return "OK", 200
 
 
-# ---------- AutoResponder app (webhook) ----------
-
-def is_business_app(name):
-    name = (name or "").lower()
-    # com.whatsapp.w4b = WhatsApp Business, com.whatsapp = normal WhatsApp
-    return "w4b" in name or "business" in name
-
-
-@app.post("/autoresponder")
-def autoresponder():
-    if SECRET and request.headers.get("X-Secret") != SECRET:
-        return jsonify(replies=[]), 401
-
-    data = request.get_json(force=True, silent=True) or {}
-    q = data.get("query") or {}
-    print("AUTORESPONDER:", data, flush=True)
-
-    text = (q.get("message") or "").strip()
-    package = q.get("messengerPackageName") or q.get("appName") or ""
-    is_group = bool(q.get("isGroup")) or bool(q.get("groupParticipant"))
-
-    if is_group or not text:
-        return jsonify(replies=[])
-
-    system = BUSINESS_PROMPT if is_business_app(package) else PERSONAL_PROMPT
-    return jsonify(replies=[{"message": safe_reply(system, text)}])
-
-
 # ---------- Whatauto (only works if you have Whatauto Pro) ----------
 
 @app.post("/message")
@@ -199,7 +171,7 @@ def message():
     if group or not text:
         return jsonify(reply="")
 
-    system = BUSINESS_PROMPT if is_business_app(app_name) else PERSONAL_PROMPT
+    system = BUSINESS_PROMPT if "business" in app_name else PERSONAL_PROMPT
     return jsonify(reply=safe_reply(system, text))
 
 
