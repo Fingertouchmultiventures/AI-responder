@@ -1,23 +1,17 @@
 import os
-import threading
+import time
 import requests
+from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 # If this model name stops working, set GEMINI_MODEL on Render to a newer
 # "flash" model listed at aistudio.google.com
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-SECRET = os.environ.get("SECRET", "")  # only used by the Whatauto /message route
-
-# Meta WhatsApp Cloud API settings (set these on Render)
-# Spaces are trimmed. If the Render variable is missing or mistyped, the
-# built-in fallback below still lets Meta's verification succeed.
-VERIFY_TOKEN = (os.environ.get("VERIFY_TOKEN") or "o2verify2026").strip()
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")      # from Meta
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")    # from Meta
-GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+SECRET = os.environ.get("SECRET", "").strip()      # optional X-Secret header check
+PAUSED = os.environ.get("PAUSED", "") == "1"       # set PAUSED=1 on Render = AI off
 
 # ---------- EDIT THESE TWO PROMPTS ----------
 
@@ -44,9 +38,6 @@ Rules:
 
 # --------------------------------------------
 
-FALLBACK = "Sorry, I'm having trouble right now. We'll reply shortly."
-seen_ids = set()  # avoids answering the same message twice if Meta retries
-
 
 def ask_gemini(system_prompt, user_text):
     url = (
@@ -64,43 +55,57 @@ def ask_gemini(system_prompt, user_text):
         json=body,
         timeout=25,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:400]}")
     parts = r.json()["candidates"][0]["content"]["parts"]
     return "".join(p.get("text", "") for p in parts).strip()
 
 
 def safe_reply(system_prompt, text):
+    """AI reply, or None if anything fails (so no error text is ever sent to a chat)."""
     try:
-        reply = ask_gemini(system_prompt, text)
-        return reply or "Thanks for your message. We'll get back to you shortly."
+        return ask_gemini(system_prompt, text) or None
     except Exception as e:
         print("GEMINI ERROR:", e, flush=True)
-        return FALLBACK
+        return None
 
 
-def send_whatsapp(to, text):
-    url = f"https://graph.facebook.com/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text},
-        },
-        timeout=20,
-    )
-    print("SEND STATUS:", r.status_code, r.text[:300], flush=True)
+# ---------- Loop protection: stops two bots replying to each other forever ----------
+
+REPLY_GAP_SECONDS = 10     # minimum seconds between replies to the same sender
+MAX_PER_HOUR = 20          # max replies to one sender per hour
+last_reply = {}
+history = defaultdict(deque)
 
 
-def handle_incoming(sender, text):
-    reply = safe_reply(BUSINESS_PROMPT, text)
-    send_whatsapp(sender, reply)
+def should_skip(sender, text):
+    t = (text or "").lower()
+    if "autoresponder.ai" in t or "having trouble right now" in t:
+        return True
+    key = (sender or "").strip().lower()
+    now = time.time()
+    if now - last_reply.get(key, 0) < REPLY_GAP_SECONDS:
+        return True
+    h = history[key]
+    while h and now - h[0] > 3600:
+        h.popleft()
+    if len(h) >= MAX_PER_HOUR:
+        return True
+    last_reply[key] = now
+    h.append(now)
+    if len(last_reply) > 5000:
+        last_reply.clear()
+        history.clear()
+    return False
 
+
+def is_business_app(name):
+    name = (name or "").lower()
+    # com.whatsapp.w4b = WhatsApp Business, com.whatsapp = normal WhatsApp
+    return "w4b" in name or "business" in name
+
+
+# ---------- Pages for checking things in your browser ----------
 
 @app.get("/")
 def home():
@@ -109,79 +114,33 @@ def home():
 
 @app.get("/check")
 def check():
-    # Shows whether settings were found. Never shows the secret values themselves.
+    # Shows whether settings were found. Never shows the secret values.
     return jsonify(
-        verify_token_set=bool(VERIFY_TOKEN),
-        verify_token_length=len(VERIFY_TOKEN),
         gemini_key_set=bool(GEMINI_API_KEY),
-        whatsapp_token_set=bool(WHATSAPP_TOKEN),
-        phone_number_id_set=bool(PHONE_NUMBER_ID),
+        model=GEMINI_MODEL,
+        paused=PAUSED,
         routes=sorted(r.rule for r in app.url_map.iter_rules()),
     )
 
 
-# ---------- Meta WhatsApp Cloud API ----------
-
-@app.get("/webhook")
-def webhook_verify():
-    # Meta calls this once when you save the webhook in the developer dashboard
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge", "")
-    if mode == "subscribe" and token in (VERIFY_TOKEN, "o2verify2026"):
-        return challenge, 200
-    return "Verification failed", 403
-
-
-@app.post("/webhook")
-def webhook_receive():
-    data = request.get_json(force=True, silent=True) or {}
-    print("WEBHOOK:", data, flush=True)
-
+@app.get("/testai")
+def testai():
+    # Open this page to see if Gemini works, or the exact reason it doesn't.
     try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                for msg in value.get("messages", []):
-                    msg_id = msg.get("id")
-                    if msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-                    if len(seen_ids) > 2000:
-                        seen_ids.clear()
-
-                    sender = msg.get("from")
-                    if msg.get("type") == "text":
-                        text = (msg.get("text", {}).get("body") or "").strip()
-                        if sender and text:
-                            # Reply in the background so Meta gets a fast 200 OK
-                            threading.Thread(
-                                target=handle_incoming, args=(sender, text), daemon=True
-                            ).start()
-                    elif sender:
-                        threading.Thread(
-                            target=send_whatsapp,
-                            args=(sender, "Thanks! Please send your request as a text message so we can help you quickly."),
-                            daemon=True,
-                        ).start()
+        sample = ask_gemini("Reply with one short friendly sentence.", "Say hello")
+        return jsonify(ok=True, model=GEMINI_MODEL, sample=sample[:100])
     except Exception as e:
-        print("WEBHOOK ERROR:", e, flush=True)
-
-    return "OK", 200
+        return jsonify(ok=False, model=GEMINI_MODEL, error=str(e)[:500]), 500
 
 
-# ---------- AutoResponder app (webhook) ----------
-
-def is_business_app(name):
-    name = (name or "").lower()
-    # com.whatsapp.w4b = WhatsApp Business, com.whatsapp = normal WhatsApp
-    return "w4b" in name or "business" in name
-
+# ---------- AutoResponder app ----------
 
 @app.post("/autoresponder")
 def autoresponder():
     if SECRET and request.headers.get("X-Secret") != SECRET:
         return jsonify(replies=[]), 401
+    if PAUSED:
+        return jsonify(replies=[])
 
     data = request.get_json(force=True, silent=True) or {}
     q = data.get("query") or {}
@@ -191,19 +150,22 @@ def autoresponder():
     package = q.get("messengerPackageName") or q.get("appName") or ""
     is_group = bool(q.get("isGroup")) or bool(q.get("groupParticipant"))
 
-    if is_group or not text:
+    if is_group or not text or should_skip(q.get("sender"), text):
         return jsonify(replies=[])
 
     system = BUSINESS_PROMPT if is_business_app(package) else PERSONAL_PROMPT
-    return jsonify(replies=[{"message": safe_reply(system, text)}])
+    reply = safe_reply(system, text)
+    return jsonify(replies=[{"message": reply}] if reply else [])
 
 
-# ---------- Whatauto (only works if you have Whatauto Pro) ----------
+# ---------- Whatauto (needs Whatauto Pro) ----------
 
 @app.post("/message")
 def message():
     if SECRET and request.headers.get("X-Secret") != SECRET:
         return jsonify(reply=""), 401
+    if PAUSED:
+        return jsonify(reply="")
 
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("message") or "").strip()
@@ -211,11 +173,11 @@ def message():
     app_name = (data.get("app") or "").lower()
     print("INCOMING:", data, flush=True)
 
-    if group or not text:
+    if group or not text or should_skip(data.get("sender"), text):
         return jsonify(reply="")
 
     system = BUSINESS_PROMPT if is_business_app(app_name) else PERSONAL_PROMPT
-    return jsonify(reply=safe_reply(system, text))
+    return jsonify(reply=safe_reply(system, text) or "")
 
 
 if __name__ == "__main__":
