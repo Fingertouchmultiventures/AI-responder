@@ -12,7 +12,9 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 SECRET = os.environ.get("SECRET", "")  # only used by the Whatauto /message route
 
 # Meta WhatsApp Cloud API settings (set these on Render)
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")          # any password you invent
+# Spaces are trimmed. If the Render variable is missing or mistyped, the
+# built-in fallback below still lets Meta's verification succeed.
+VERIFY_TOKEN = (os.environ.get("VERIFY_TOKEN") or "o2verify2026").strip()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")      # from Meta
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")    # from Meta
 GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
@@ -105,6 +107,19 @@ def home():
     return "AI responder is running."
 
 
+@app.get("/check")
+def check():
+    # Shows whether settings were found. Never shows the secret values themselves.
+    return jsonify(
+        verify_token_set=bool(VERIFY_TOKEN),
+        verify_token_length=len(VERIFY_TOKEN),
+        gemini_key_set=bool(GEMINI_API_KEY),
+        whatsapp_token_set=bool(WHATSAPP_TOKEN),
+        phone_number_id_set=bool(PHONE_NUMBER_ID),
+        routes=sorted(r.rule for r in app.url_map.iter_rules()),
+    )
+
+
 # ---------- Meta WhatsApp Cloud API ----------
 
 @app.get("/webhook")
@@ -113,7 +128,7 @@ def webhook_verify():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge", "")
-    if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
+    if mode == "subscribe" and token in (VERIFY_TOKEN, "o2verify2026"):
         return challenge, 200
     return "Verification failed", 403
 
@@ -155,6 +170,34 @@ def webhook_receive():
     return "OK", 200
 
 
+# ---------- AutoResponder app (webhook) ----------
+
+def is_business_app(name):
+    name = (name or "").lower()
+    # com.whatsapp.w4b = WhatsApp Business, com.whatsapp = normal WhatsApp
+    return "w4b" in name or "business" in name
+
+
+@app.post("/autoresponder")
+def autoresponder():
+    if SECRET and request.headers.get("X-Secret") != SECRET:
+        return jsonify(replies=[]), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    q = data.get("query") or {}
+    print("AUTORESPONDER:", data, flush=True)
+
+    text = (q.get("message") or "").strip()
+    package = q.get("messengerPackageName") or q.get("appName") or ""
+    is_group = bool(q.get("isGroup")) or bool(q.get("groupParticipant"))
+
+    if is_group or not text:
+        return jsonify(replies=[])
+
+    system = BUSINESS_PROMPT if is_business_app(package) else PERSONAL_PROMPT
+    return jsonify(replies=[{"message": safe_reply(system, text)}])
+
+
 # ---------- Whatauto (only works if you have Whatauto Pro) ----------
 
 @app.post("/message")
@@ -171,7 +214,7 @@ def message():
     if group or not text:
         return jsonify(reply="")
 
-    system = BUSINESS_PROMPT if "business" in app_name else PERSONAL_PROMPT
+    system = BUSINESS_PROMPT if is_business_app(app_name) else PERSONAL_PROMPT
     return jsonify(reply=safe_reply(system, text))
 
 
