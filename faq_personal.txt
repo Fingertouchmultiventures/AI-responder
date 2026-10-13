@@ -1,0 +1,26 @@
+# PERSONAL FAQ
+#
+# Same format as the business file. Blocks are separated by a line containing only ---
+#
+#   Q: the question in your own words
+#   KEYWORDS: words people might use, separated by commas   (optional but recommended)
+#   A: the exact reply to send
+#
+# If a message contains a KEYWORD, that answer is sent. If nothing matches, the AI replies
+# in a casual friendly tone using what is in this file. Lines starting with # are ignored.
+
+Q: Greeting
+KEYWORDS: hi, hello, hey, good morning, good afternoon, good evening
+A: Hey! 😊 Thanks for your message. I'll get back to you soon.
+---
+Q: Call me
+KEYWORDS: call me, give me a call, please call
+A: Got your message. I'll call you back when I'm free.
+---
+Q: Urgent
+KEYWORDS: urgent, emergency, asap
+A: I've seen your message and I'll respond as soon as I can. If it's an emergency, please call me directly.
+---
+Q: Asking about business services
+KEYWORDS: graphics, flyer, logo, website, excel, microsoft, powerpoint, architectural, cinematography, video shoot
+A: For these services please message O² Affairs on WhatsApp and the team will help you: https://wa.me/message/Y62MOEWGUOAXF1

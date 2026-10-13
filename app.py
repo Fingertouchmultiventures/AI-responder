@@ -1,50 +1,108 @@
 import os
-import threading
+import re
+import time
+import difflib
 import requests
+from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-# If this model name stops working, set GEMINI_MODEL on Render to a newer
-# "flash" model listed at aistudio.google.com
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-SECRET = os.environ.get("SECRET", "")  # only used by the Whatauto /message route
+# ---------------- Settings (all optional, set on Render > Environment) ----------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+USE_AI = os.environ.get("USE_AI", "1") != "0"          # USE_AI=0 -> FAQ answers only
+DEFAULT_REPLY = os.environ.get("DEFAULT_REPLY", "").strip()  # sent when nothing matches and AI is off/fails
+SECRET = os.environ.get("SECRET", "").strip()          # optional X-Secret header from the phone app
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()    # optional: protects /ask /faq /testai with ?key=
+PAUSED = os.environ.get("PAUSED", "") == "1"           # PAUSED=1 -> bot stops replying
 
-# Meta WhatsApp Cloud API settings (set these on Render)
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")          # any password you invent
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")      # from Meta
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")    # from Meta
-GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v21.0")
-
-# ---------- EDIT THESE TWO PROMPTS ----------
-
-PERSONAL_PROMPT = """You are replying to WhatsApp messages on behalf of the owner's
+# ---------------- How the AI should sound when no FAQ entry matches ----------------
+PERSONAL_PERSONA = """You are replying to WhatsApp messages on behalf of the owner's
 personal number. Be casual, warm and friendly, like a good friend texting.
-Keep replies short (1-3 sentences). If someone asks something you can't know
-(plans, location, personal matters), say the owner will get back to them soon.
-Never invent facts."""
+Keep replies short (1-3 sentences)."""
 
-BUSINESS_PROMPT = """You are the WhatsApp assistant for O² Affairs.
-About us: We are O² Affairs, experts in Microsoft Office tools to get your tasks done.
-We also offer: Graphics design, Cinematography, Architectural design,
-Site creation and development, and many more services. We deliver across the nation.
+BUSINESS_PERSONA = """You are the WhatsApp assistant for O² Affairs.
+O² Affairs: experts in Microsoft Office tools to get your tasks done. Also offers
+graphics design, cinematography, architectural design, site creation and development,
+and more. Delivers across the nation.
 Slogan: "Finger of God makes a difference. A trial will definitely convince you."
+Be polite, professional and warm. Keep replies short (2-4 sentences).
+Business link: https://wa.me/message/Y62MOEWGUOAXF1"""
 
+AI_RULES = """
 Rules:
-- Be polite, professional and warm. Keep replies short (2-4 sentences).
-- Greet new customers and ask what service they need.
-- Never invent prices, timelines or availability. For quotes, say the team
-  will reply shortly with details.
-- Encourage customers to describe their task clearly so we can help faster.
-- Business link: https://wa.me/message/Y62MOEWGUOAXF1
+- Use ONLY the facts in the KNOWLEDGE BASE and the description above.
+- Never invent prices, timelines, availability, addresses or promises.
+- If the answer is not covered, say the team will reply shortly. Do not guess.
 """
 
-# --------------------------------------------
+# ---------------- FAQ files ----------------
 
-FALLBACK = "Sorry, I'm having trouble right now. We'll reply shortly."
-seen_ids = set()  # avoids answering the same message twice if Meta retries
+def load_faq(filename):
+    """Reads faq_*.txt. Entries are separated by a line containing only ---
+    Each entry has:  Q: question   KEYWORDS: a, b, c (optional)   A: answer"""
+    path = os.path.join(BASE_DIR, filename)
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    entries = []
+    for block in re.split(r"^\s*-{3,}\s*$", raw, flags=re.M):
+        parts = {"q": [], "k": [], "a": []}
+        cur = None
+        for line in block.splitlines():
+            m = re.match(r"^\s*(Q|KEYWORDS|A)\s*:\s*(.*)$", line, flags=re.I)
+            if m:
+                cur = {"Q": "q", "KEYWORDS": "k", "A": "a"}[m.group(1).upper()]
+                parts[cur].append(m.group(2))
+            elif cur and not (cur != "a" and line.strip().startswith("#")):
+                parts[cur].append(line)
+        question = " ".join(parts["q"]).strip()
+        answer = "\n".join(parts["a"]).strip()
+        keywords = [k.strip() for k in ",".join(parts["k"]).split(",") if k.strip()]
+        if answer and (question or keywords):
+            entries.append({"question": question, "keywords": keywords, "answer": answer})
+    return entries
 
+
+FAQ = {
+    "business": load_faq("faq_business.txt"),
+    "personal": load_faq("faq_personal.txt"),
+}
+
+
+def normalize(text):
+    text = (text or "").lower().replace("’", "'")
+    text = re.sub(r"[^a-z0-9']+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def match_faq(entries, text):
+    """Returns the best matching answer or None.
+    Keyword hit (whole word/phrase): longer keyword wins. Near-identical question wins over keywords."""
+    t = normalize(text)
+    if not t:
+        return None
+    best_answer, best_score = None, 0
+    for e in entries:
+        score = 0
+        for kw in e["keywords"]:
+            kn = normalize(kw)
+            if kn and re.search(r"(?<![a-z0-9'])" + re.escape(kn) + r"(?![a-z0-9'])", t):
+                score = max(score, 50 + len(kn))
+        if e["question"]:
+            ratio = difflib.SequenceMatcher(None, t, normalize(e["question"])).ratio()
+            if ratio >= 0.8:
+                score = max(score, 100 * ratio + 100)
+        if score > best_score:
+            best_answer, best_score = e["answer"], score
+    return best_answer
+
+
+# ---------------- Gemini (fallback when no FAQ entry matches) ----------------
 
 def ask_gemini(system_prompt, user_text):
     url = (
@@ -54,125 +112,187 @@ def ask_gemini(system_prompt, user_text):
     body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": {"maxOutputTokens": 800, "temperature": 0.7},
+        "generationConfig": {"maxOutputTokens": 800, "temperature": 0.5},
     }
-    r = requests.post(
-        url,
-        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-        json=body,
-        timeout=25,
-    )
-    r.raise_for_status()
+    r = None
+    for attempt in range(3):  # retry when Google is busy (503) or rate limiting (429)
+        r = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=20,
+        )
+        if r.ok or r.status_code not in (429, 500, 503):
+            break
+        time.sleep(1.5 * (attempt + 1))
+    if not r.ok:
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:400]}")
     parts = r.json()["candidates"][0]["content"]["parts"]
     return "".join(p.get("text", "") for p in parts).strip()
 
 
-def safe_reply(system_prompt, text):
+def knowledge_text(kind):
+    items = [f"Q: {e['question'] or ', '.join(e['keywords'])}\nA: {e['answer']}" for e in FAQ[kind]]
+    return "\n\n".join(items)
+
+
+def ai_reply(kind, text):
+    persona = BUSINESS_PERSONA if kind == "business" else PERSONAL_PERSONA
+    system = f"{persona}\n{AI_RULES}\nKNOWLEDGE BASE:\n{knowledge_text(kind) or '(empty)'}"
     try:
-        reply = ask_gemini(system_prompt, text)
-        return reply or "Thanks for your message. We'll get back to you shortly."
+        return ask_gemini(system, text) or None
     except Exception as e:
         print("GEMINI ERROR:", e, flush=True)
-        return FALLBACK
+        return None
 
 
-def send_whatsapp(to, text):
-    url = f"https://graph.facebook.com/{GRAPH_VERSION}/{PHONE_NUMBER_ID}/messages"
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text},
-        },
-        timeout=20,
-    )
-    print("SEND STATUS:", r.status_code, r.text[:300], flush=True)
+def get_reply(kind, text, use_ai=True):
+    """FAQ first, then AI, then DEFAULT_REPLY. Returns (reply or None, source)."""
+    hit = match_faq(FAQ[kind], text)
+    if hit:
+        return hit, "faq"
+    if use_ai and USE_AI and GEMINI_API_KEY:
+        reply = ai_reply(kind, text)
+        if reply:
+            return reply, "ai"
+    if DEFAULT_REPLY:
+        return DEFAULT_REPLY, "default"
+    return None, "none"
 
 
-def handle_incoming(sender, text):
-    reply = safe_reply(BUSINESS_PROMPT, text)
-    send_whatsapp(sender, reply)
+# ---------------- Loop protection (stops two bots replying to each other forever) ----------------
 
+REPLY_GAP_SECONDS = 10
+MAX_PER_HOUR = 20
+last_reply = {}
+history = defaultdict(deque)
+
+
+def should_skip(sender, text):
+    t = (text or "").lower()
+    if "autoresponder.ai" in t or "having trouble right now" in t:
+        return True
+    key = (sender or "").strip().lower()
+    now = time.time()
+    if now - last_reply.get(key, 0) < REPLY_GAP_SECONDS:
+        return True
+    h = history[key]
+    while h and now - h[0] > 3600:
+        h.popleft()
+    if len(h) >= MAX_PER_HOUR:
+        return True
+    last_reply[key] = now
+    h.append(now)
+    if len(last_reply) > 5000:
+        last_reply.clear()
+        history.clear()
+    return False
+
+
+def kind_for_app(name):
+    name = (name or "").lower()
+    # com.whatsapp.w4b = WhatsApp Business, com.whatsapp = normal WhatsApp
+    return "business" if ("w4b" in name or "business" in name) else "personal"
+
+
+def admin_ok():
+    return (not ADMIN_KEY) or request.args.get("key", "") == ADMIN_KEY
+
+
+# ---------------- Pages you can open in a browser ----------------
 
 @app.get("/")
 def home():
     return "AI responder is running."
 
 
-# ---------- Meta WhatsApp Cloud API ----------
+@app.get("/check")
+def check():
+    return jsonify(
+        faq_business_entries=len(FAQ["business"]),
+        faq_personal_entries=len(FAQ["personal"]),
+        gemini_key_set=bool(GEMINI_API_KEY),
+        ai_fallback_on=bool(USE_AI and GEMINI_API_KEY),
+        model=GEMINI_MODEL,
+        paused=PAUSED,
+    )
 
-@app.get("/webhook")
-def webhook_verify():
-    # Meta calls this once when you save the webhook in the developer dashboard
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge", "")
-    if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "Verification failed", 403
+
+@app.get("/faq")
+def faq_list():
+    if not admin_ok():
+        return jsonify(error="add ?key=YOUR_ADMIN_KEY"), 401
+    return jsonify({
+        kind: [{"question": e["question"], "keywords": e["keywords"]} for e in entries]
+        for kind, entries in FAQ.items()
+    })
 
 
-@app.post("/webhook")
-def webhook_receive():
-    data = request.get_json(force=True, silent=True) or {}
-    print("WEBHOOK:", data, flush=True)
+@app.get("/ask")
+def ask():
+    # Try it in your browser:  /ask?app=business&q=how much for graphics design
+    # Add &ai=0 to test only the FAQ files.
+    if not admin_ok():
+        return jsonify(error="add &key=YOUR_ADMIN_KEY"), 401
+    q = request.args.get("q", "")
+    kind = "personal" if request.args.get("app", "business").lower().startswith("p") else "business"
+    reply, source = get_reply(kind, q, use_ai=request.args.get("ai", "1") != "0")
+    return jsonify(app=kind, question=q, source=source, reply=reply)
 
+
+@app.get("/testai")
+def testai():
+    if not admin_ok():
+        return jsonify(error="add ?key=YOUR_ADMIN_KEY"), 401
     try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                for msg in value.get("messages", []):
-                    msg_id = msg.get("id")
-                    if msg_id in seen_ids:
-                        continue
-                    seen_ids.add(msg_id)
-                    if len(seen_ids) > 2000:
-                        seen_ids.clear()
-
-                    sender = msg.get("from")
-                    if msg.get("type") == "text":
-                        text = (msg.get("text", {}).get("body") or "").strip()
-                        if sender and text:
-                            # Reply in the background so Meta gets a fast 200 OK
-                            threading.Thread(
-                                target=handle_incoming, args=(sender, text), daemon=True
-                            ).start()
-                    elif sender:
-                        threading.Thread(
-                            target=send_whatsapp,
-                            args=(sender, "Thanks! Please send your request as a text message so we can help you quickly."),
-                            daemon=True,
-                        ).start()
+        sample = ask_gemini("Reply with one short friendly sentence.", "Say hello")
+        return jsonify(ok=True, model=GEMINI_MODEL, sample=sample[:100])
     except Exception as e:
-        print("WEBHOOK ERROR:", e, flush=True)
-
-    return "OK", 200
+        return jsonify(ok=False, model=GEMINI_MODEL, error=str(e)[:500]), 500
 
 
-# ---------- Whatauto (only works if you have Whatauto Pro) ----------
+# ---------------- Phone app routes ----------------
 
-@app.post("/message")
+@app.post("/autoresponder")
+def autoresponder():
+    if SECRET and request.headers.get("X-Secret") != SECRET:
+        return jsonify(replies=[]), 401
+    if PAUSED:
+        return jsonify(replies=[])
+
+    data = request.get_json(force=True, silent=True) or {}
+    q = data.get("query") or {}
+    print("AUTORESPONDER:", data, flush=True)
+
+    text = (q.get("message") or "").strip()
+    package = q.get("messengerPackageName") or q.get("appName") or ""
+    is_group = bool(q.get("isGroup")) or bool(q.get("groupParticipant"))
+    if is_group or not text or should_skip(q.get("sender"), text):
+        return jsonify(replies=[])
+
+    reply, source = get_reply(kind_for_app(package), text)
+    print("REPLY SOURCE:", source, flush=True)
+    return jsonify(replies=[{"message": reply}] if reply else [])
+
+
+@app.post("/message")  # Whatauto Pro / MacroDroid / Tasker style: {"reply": "..."}
 def message():
     if SECRET and request.headers.get("X-Secret") != SECRET:
         return jsonify(reply=""), 401
+    if PAUSED:
+        return jsonify(reply="")
 
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("message") or "").strip()
     group = data.get("group_name") or ""
-    app_name = (data.get("app") or "").lower()
+    app_name = data.get("app") or ""
     print("INCOMING:", data, flush=True)
-
-    if group or not text:
+    if group or not text or should_skip(data.get("sender"), text):
         return jsonify(reply="")
 
-    system = BUSINESS_PROMPT if "business" in app_name else PERSONAL_PROMPT
-    return jsonify(reply=safe_reply(system, text))
+    reply, source = get_reply(kind_for_app(app_name), text)
+    print("REPLY SOURCE:", source, flush=True)
+    return jsonify(reply=reply or "")
 
 
 if __name__ == "__main__":

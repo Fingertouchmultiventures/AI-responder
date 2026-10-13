@@ -1,0 +1,49 @@
+# O² AFFAIRS - BUSINESS FAQ
+#
+# HOW TO TEACH THE BOT
+# Each answer is one block. Blocks are separated by a line containing only ---
+#
+#   Q: the question in your own words
+#   KEYWORDS: words customers might use, separated by commas   (optional but recommended)
+#   A: the exact reply to send
+#
+# - If the customer's message contains any KEYWORD, the bot sends that answer.
+# - If several blocks match, the one with the longest keyword wins.
+# - If nothing matches, the AI answers using everything in this file.
+# - Lines starting with # are notes and are ignored.
+# - To add an answer: copy a block, change it, and commit the file on GitHub.
+#   The server updates itself in about a minute.
+
+Q: Greeting
+KEYWORDS: hi, hello, hey, good morning, good afternoon, good evening
+A: Hello, welcome to O² Affairs! 👋 We help with Microsoft Office tasks, graphics design, cinematography, architectural design, site creation and more. What can we help you with today?
+---
+Q: What services do you offer?
+KEYWORDS: services, what do you do, what do you offer, what can you do, do you do
+A: At O² Affairs we offer:
+• Microsoft Office tasks (Word, Excel, PowerPoint and more)
+• Graphics design
+• Cinematography
+• Architectural design
+• Site creation and development
+...and much more. Tell us what you need and we'll help!
+---
+Q: How much does it cost?
+KEYWORDS: price, prices, cost, how much, charge, rate, quote, pricing
+A: Our price depends on the task. Please tell us exactly what you need (and any deadline) and our team will send you a quote shortly.
+---
+Q: Do you deliver?
+KEYWORDS: deliver, delivery, nationwide, across the nation, outside
+A: Yes, we deliver across the nation. 🇳🇬
+---
+Q: Can I try before I commit?
+KEYWORDS: trial, sample, try you
+A: A trial will definitely convince you! Tell us your task and we'll get started.
+---
+Q: How do I place an order?
+KEYWORDS: order, get started, hire, how do i start, start a project
+A: Simply tell us what you need, any deadline, and any files or examples you have. Our team will reply shortly with the next steps.
+---
+Q: How can I contact you?
+KEYWORDS: contact, call, phone, reach you, whatsapp
+A: You can reach O² Affairs on WhatsApp here: https://wa.me/message/Y62MOEWGUOAXF1
