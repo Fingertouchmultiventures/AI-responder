@@ -4,7 +4,7 @@ import time
 import difflib
 import requests
 from collections import defaultdict, deque
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +17,11 @@ DEFAULT_REPLY = os.environ.get("DEFAULT_REPLY", "").strip()  # sent when nothing
 SECRET = os.environ.get("SECRET", "").strip()          # optional X-Secret header from the phone app
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "").strip()    # optional: protects /ask /faq /testai with ?key=
 PAUSED = os.environ.get("PAUSED", "") == "1"           # PAUSED=1 -> bot stops replying
+# SaleSmartly: put a secret word in the webhook URL path, e.g. /salesmartly/mysecret123
+SALESMARTLY_KEY = os.environ.get("SALESMARTLY_KEY", "").strip()
+# SaleSmartly: words that identify your PERSONAL WhatsApp channel (its channel name or number),
+# separated by commas. Everything else is treated as the business number.
+PERSONAL_MATCH = [x.strip().lower() for x in os.environ.get("PERSONAL_CHANNEL_MATCH", "").split(",") if x.strip()]
 
 # ---------------- How the AI should sound when no FAQ entry matches ----------------
 PERSONAL_PERSONA = """You are replying to WhatsApp messages on behalf of the owner's
@@ -284,7 +289,7 @@ def message():
 
     data = request.get_json(force=True, silent=True) or {}
     text = (data.get("message") or "").strip()
-    group = data.get("group_name") or ""
+    group = data.get("group_name") or ("group" if str(data.get("is_group", "0")) == "1" else "")
     app_name = data.get("app") or ""
     print("INCOMING:", data, flush=True)
     if group or not text or should_skip(data.get("sender"), text):
@@ -293,6 +298,87 @@ def message():
     reply, source = get_reply(kind_for_app(app_name), text)
     print("REPLY SOURCE:", source, flush=True)
     return jsonify(reply=reply or "")
+
+
+@app.get("/tasker")  # for Tasker / MacroDroid: returns plain text, or ### when nothing should be sent
+def tasker():
+    if SECRET and not (request.headers.get("X-Secret") == SECRET or request.args.get("secret") == SECRET):
+        return Response("###", mimetype="text/plain")
+    if PAUSED:
+        return Response("###", mimetype="text/plain")
+
+    text = request.args.get("message", "").strip()
+    sender = request.args.get("sender", "")
+    app_name = request.args.get("app", "")
+    is_group = request.args.get("is_group", "0") == "1"
+    print("TASKER:", {"app": app_name, "sender": sender, "message": text, "is_group": is_group}, flush=True)
+
+    # Tasker leaves a variable unreplaced (e.g. "%message") when it has no value
+    if is_group or not text or text.startswith("%") or should_skip(sender, text):
+        return Response("###", mimetype="text/plain")
+
+    reply, source = get_reply(kind_for_app(app_name), text)
+    print("REPLY SOURCE:", source, flush=True)
+    return Response(reply or "###", mimetype="text/plain; charset=utf-8")
+
+
+# ---------------- SaleSmartly (Team > Member Management > AI Member > Custom Webhook) ----------------
+
+def salesmartly_kind(d):
+    label = f"{d.get('channel_name', '')} {d.get('channel_uid', '')}".lower()
+    return "personal" if any(p in label for p in PERSONAL_MATCH) else "business"
+
+
+@app.post("/salesmartly")
+@app.post("/salesmartly/<key>")
+def salesmartly(key=""):
+    ok = {"code": 0, "msg": "Success"}
+    if SALESMARTLY_KEY and key != SALESMARTLY_KEY:
+        return jsonify(code=-1, msg="unauthorized"), 401
+    if PAUSED:
+        return jsonify(ok)
+
+    body = request.get_json(force=True, silent=True) or {}
+    print("SALESMARTLY:", body, flush=True)  # check Render > Logs to see exactly what SaleSmartly sends
+
+    d = body.get("data") or {}
+    if body.get("event") != "message" or not isinstance(d, dict):
+        return jsonify(ok)
+
+    text = d.get("msg")
+    # Only answer plain text sent by the customer (sender_type 1), not by your team,
+    # and not when a human agent already owns the chat (sys_user_id > 0)
+    if str(d.get("msg_type")) != "text" or not isinstance(text, str) or not text.strip():
+        return jsonify(ok)
+    if str(d.get("sender_type")) != "1":
+        return jsonify(ok)
+    try:
+        if int(d.get("sys_user_id") or 0) > 0:
+            return jsonify(ok)
+    except (TypeError, ValueError):
+        pass
+    if should_skip(d.get("chat_user_id"), text):
+        return jsonify(ok)
+
+    reply, source = get_reply(salesmartly_kind(d), text.strip())
+    print("REPLY SOURCE:", source, flush=True)
+    if not reply:
+        return jsonify(ok)
+
+    return jsonify({
+        "code": 0,
+        "msg": "Success",
+        "data": {
+            "msg_type": 1,
+            "msg": reply,
+            "chat_user_id": d.get("chat_user_id"),
+            "chat_session_id": d.get("chat_session_id"),
+            "send_time": str(int(time.time() * 1000)),
+            "channel": d.get("channel"),
+            "channel_uid": d.get("channel_uid"),
+            "channel_name": d.get("channel_name"),
+        },
+    })
 
 
 if __name__ == "__main__":
